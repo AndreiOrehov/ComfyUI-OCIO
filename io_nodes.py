@@ -828,6 +828,12 @@ def _save_still(path, rgb, fmt, bit_depth, alpha=None, colorspace=None, compress
 # line changed to "bt709".
 _SRGB_TRC = "iec61966-2-1"
 
+# Camera LOG encodings in the ACES config, matched against the lowercased output colorspace name. Only the log
+# CURVES belong here - their scene-linear partners ("Linear ARRI Wide Gamut 3", ...) are a different problem, so
+# match "logc" rather than "arri". See _video_color_tags() for why these get no NCLC tags.
+_LOG_CS_MARKERS = ("logc", "s-log3", "log3g10", "canonlog", "v-log", "d-log", "apple log", "bmdfilm",
+                   "davinci intermediate")
+
 
 def _video_color_tags(output_colorspace):
     """Map the (already-converted-to) output colorspace to ffmpeg NCLC color tags, so the written file is
@@ -843,6 +849,16 @@ def _video_color_tags(output_colorspace):
     So this returns BOTH the (still-needed, still-correct) trailing output options AND the setparams -vf; the
     caller must place the -vf before the output path same as any other output option."""
     cs = (output_colorspace or "").lower()
+    if any(m in cs for m in _LOG_CS_MARKERS):
+        # A camera log master. NCLC has no code for a log curve or for a camera wide gamut: ffmpeg's
+        # -color_primaries list stops at bt709 / bt2020 / smpte431..., with nothing for ARRI Wide Gamut 3,
+        # and -color_trc's "log100" / "log316" are the ITU 100:1 curves, NOT LogC / S-Log / V-Log. Falling
+        # through to the branches below would stamp bt709 + sRGB, mis-tagging the file on BOTH axes and
+        # making a player apply a display transform to log data. So tag only what is actually true - the
+        # encode is limited range - and leave primaries / transfer / matrix unspecified, the way camera
+        # recorders ship log. No colr atom either: it exists to carry those three values. The grade assigns
+        # the input colorspace by hand regardless.
+        return ["-vf", "setparams=range=tv", "-color_range", "tv"]
     if "2100" in cs or "pq" in cs:
         prim, trc, spc = "bt2020", "smpte2084", "bt2020nc"          # HDR
     elif "1886" in cs or "rec.709" in cs or "rec709" in cs:
@@ -1176,7 +1192,7 @@ class OCIOWrite:
     def INPUT_TYPES(cls):
         return {"required": {
             "profile": (["none", "auto", "LTX 2.3 HDR", "LTX 2.5 -> Rec.709 video",
-                        "LumiPic LogC3 (Flux/Qwen)", "LumiPic V10 LogC4",
+                        "-> ARRI LogC3 master", "LumiPic LogC3 (Flux/Qwen)", "LumiPic V10 LogC4",
                         "Seedance 4K 10-bit"],
                         {"default": "none",
                          "tooltip": "Source preset. The HDR ones set from/output colorspace, force EXR 16f, and (LumiPic) decode the log curve inside Write. 'LTX 2.5 -> Rec.709 video' is instead an SDR DELIVERY preset: sRGB - Display -> Rec.1886 Rec.709 for a broadcast-tagged movie, leaving still_format / bit_depth alone (LTX 2.5 ships no HDR IC-LoRA, so its output is display-referred, not scene-linear). 'auto' detects the upstream source in the front-end (LTX HDR reliably; LumiPic best-effort) and never picks a delivery preset for you. Manual colorspace edits still win. Seedance is a placeholder (pending)."}),
@@ -1262,6 +1278,12 @@ class OCIOWrite:
         elif profile == "LTX 2.3 HDR" and not raw_data:
             from_colorspace = "Linear Rec.709 (sRGB)"
             output_colorspace = "ACEScg"
+        elif profile == "-> ARRI LogC3 master" and not raw_data:
+            # Delivery preset for marrying generated shots into an ARRI-based grade. NOTE this cannot invent
+            # latitude: an SDR, display-referred source stays clipped, it just wears a log curve afterwards.
+            # Prefer prores_4444 (12-bit) over the 10-bit profiles - log puts the shadows where banding shows.
+            from_colorspace = WORKING
+            output_colorspace = "ARRI LogC3 (EI800)"
         elif profile == "LTX 2.5 -> Rec.709 video" and not raw_data:
             # SDR delivery, not an HDR decode: LTX 2.5 has no HDR IC-LoRA, so VAE Decode gives display-referred
             # sRGB. Rec.1886 carries the broadcast 2.4 curve, and _video_color_tags() reads "1886"/"rec.709"

@@ -1138,6 +1138,10 @@ const PROFILE_CS = {
     // plain display-referred sRGB (core's Create Video treats it that way too). Rec.1886 = the broadcast 2.4
     // curve an NLE expects. No fmt/bit: this one must not touch the still/sequence settings.
     "LTX 2.5 -> Rec.709 video":  { from: CS_SRGB, out: "Rec.1886 Rec.709 - Display" },
+    // Log DELIVERY, for cutting generated shots into an ARRI-based grade. It cannot bring back latitude an
+    // SDR source never had. Also carries no fmt/bit - see above. Pair it with prores_4444 (12-bit) by hand:
+    // 10-bit log bands in the shadows. The written movie is left untagged (no NCLC code exists for LogC).
+    "-> ARRI LogC3 master":      { from: CS_SRGB, out: "ARRI LogC3 (EI800)" },
 };
 // generic upstream tracer: walk input links back through N nodes until `test(node)` matches
 function findUpstream(node, test, seen) {
