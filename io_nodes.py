@@ -1175,10 +1175,11 @@ class OCIOWrite:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "profile": (["none", "auto", "LTX 2.3 HDR", "LumiPic LogC3 (Flux/Qwen)", "LumiPic V10 LogC4",
+            "profile": (["none", "auto", "LTX 2.3 HDR", "LTX 2.5 -> Rec.709 video",
+                        "LumiPic LogC3 (Flux/Qwen)", "LumiPic V10 LogC4",
                         "Seedance 4K 10-bit"],
                         {"default": "none",
-                         "tooltip": "HDR source preset. Sets from/output colorspace, forces EXR 16f, and (LumiPic) decodes the log curve inside Write. 'auto' detects the upstream source in the front-end (LTX reliably; LumiPic best-effort). Manual colorspace edits still win. Seedance is a placeholder (pending)."}),
+                         "tooltip": "Source preset. The HDR ones set from/output colorspace, force EXR 16f, and (LumiPic) decode the log curve inside Write. 'LTX 2.5 -> Rec.709 video' is instead an SDR DELIVERY preset: sRGB - Display -> Rec.1886 Rec.709 for a broadcast-tagged movie, leaving still_format / bit_depth alone (LTX 2.5 ships no HDR IC-LoRA, so its output is display-referred, not scene-linear). 'auto' detects the upstream source in the front-end (LTX HDR reliably; LumiPic best-effort) and never picks a delivery preset for you. Manual colorspace edits still win. Seedance is a placeholder (pending)."}),
             "from_colorspace": _cs_combo(WORKING),
             "output_colorspace": _cs_combo("ACEScg"),
             "container": (["still image", "sequence", "video"], {"default": "sequence"}),
@@ -1261,6 +1262,12 @@ class OCIOWrite:
         elif profile == "LTX 2.3 HDR" and not raw_data:
             from_colorspace = "Linear Rec.709 (sRGB)"
             output_colorspace = "ACEScg"
+        elif profile == "LTX 2.5 -> Rec.709 video" and not raw_data:
+            # SDR delivery, not an HDR decode: LTX 2.5 has no HDR IC-LoRA, so VAE Decode gives display-referred
+            # sRGB. Rec.1886 carries the broadcast 2.4 curve, and _video_color_tags() reads "1886"/"rec.709"
+            # out of this name to stamp bt709 primaries/transfer/matrix on the movie.
+            from_colorspace = WORKING
+            output_colorspace = "Rec.1886 Rec.709 - Display"
         # "Seedance 4K 10-bit" and "none"/"auto": no backend mapping - auto is resolved front-end, Seedance is
         # a pending placeholder (do not invent a colorspace mapping for it).
         if profile in ("LTX 2.3 HDR", "LumiPic LogC3 (Flux/Qwen)", "LumiPic V10 LogC4") and not raw_data \

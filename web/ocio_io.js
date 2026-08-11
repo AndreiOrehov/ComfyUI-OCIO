@@ -1134,6 +1134,10 @@ const PROFILE_CS = {
     "LTX 2.3 HDR":               { from: "Linear Rec.709 (sRGB)", out: "ACEScg", fmt: "exr", bit: "16f" },
     "LumiPic LogC3 (Flux/Qwen)": { from: "Linear Rec.709 (sRGB)", out: "ACEScg", fmt: "exr", bit: "16f" },
     "LumiPic V10 LogC4":         { from: "Linear Rec.709 (sRGB)", out: "ACEScg", fmt: "exr", bit: "16f" },
+    // SDR delivery preset, NOT an HDR source decode: LTX 2.5 ships no HDR IC-LoRA, so its VAE Decode output is
+    // plain display-referred sRGB (core's Create Video treats it that way too). Rec.1886 = the broadcast 2.4
+    // curve an NLE expects. No fmt/bit: this one must not touch the still/sequence settings.
+    "LTX 2.5 -> Rec.709 video":  { from: CS_SRGB, out: "Rec.1886 Rec.709 - Display" },
 };
 // generic upstream tracer: walk input links back through N nodes until `test(node)` matches
 function findUpstream(node, test, seen) {
@@ -1156,8 +1160,8 @@ function applyProfile(node, profileName) {
     node._ocioProfileSetting = true;                    // guard: the colorspace writes below are OURS, not a manual edit
     setWSilent(node, "from_colorspace", p.from);
     setWSilent(node, "output_colorspace", p.out);
-    setWSilent(node, "still_format", p.fmt);
-    setWSilent(node, "bit_depth", p.bit);
+    if (p.fmt) setWSilent(node, "still_format", p.fmt);   // a video-delivery preset carries neither, and must
+    if (p.bit) setWSilent(node, "bit_depth", p.bit);      // leave the still/sequence settings exactly as found
     node._ocioProfileSetting = false;
     node.setDirtyCanvas(true, true);
 }
