@@ -2212,6 +2212,7 @@ app.registerExtension({
                     const isSeq = c === "sequence";
                     showWidget(node, W(node, "still_format"), !isVideo);
                     showWidget(node, W(node, "video_codec"), isVideo);
+                    showWidget(node, W(node, "write_audio"), isVideo);         // a soundtrack only means anything for a movie
                     showWidget(node, W(node, "bit_depth"), !isVideo);          // video's real depth is in the codec footer instead
                     applyCompressionVis();
                     showWidget(node, W(node, "auto_range"), !isStill);         // still image writes one chosen frame, no range

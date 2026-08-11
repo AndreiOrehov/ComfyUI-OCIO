@@ -854,7 +854,43 @@ def _video_color_tags(output_colorspace):
             "-color_range", "tv", "-movflags", "+write_colr"]
 
 
-def save_video(arr01, out_path, codec, fps, output_colorspace=None):
+def _audio_for_range(audio, start_frame, end_frame, fps):
+    """Trim a ComfyUI AUDIO dict to the frame sub-range actually written, so sound stays in sync when
+    first_frame / last_frame select only part of the batch. start_frame / end_frame are 0-based batch
+    indices (the same s / e used to slice the picture). Returns None when the range holds no samples."""
+    if not audio or fps <= 0:
+        return audio
+    wf, sr = audio.get("waveform"), int(audio.get("sample_rate") or 0)
+    if wf is None or sr <= 0:
+        return audio
+    w = wf[..., int(round(start_frame * sr / fps)):int(round(end_frame * sr / fps))]
+    return {"waveform": w, "sample_rate": sr} if w.shape[-1] else None
+
+
+def _audio_raw_temp(audio):
+    """ComfyUI AUDIO -> a temp raw f32le file ffmpeg reads as a second input (-f f32le -ar .. -ac ..).
+    Headerless PCM keeps the full float precision and needs no audio library (the pack already depends on
+    ffmpeg for video). Returns (path, sample_rate, channels), or None when there is nothing to write."""
+    if not audio:
+        return None
+    wf, sr = audio.get("waveform"), int(audio.get("sample_rate") or 0)
+    if wf is None or sr <= 0:
+        return None
+    w = wf.detach().cpu().float() if hasattr(wf, "detach") else torch.as_tensor(wf).float()
+    if w.ndim == 3:
+        w = w[0]                                     # [B,C,N] -> [C,N]; only the first batch item is written
+    if w.ndim == 1:
+        w = w[None]                                  # [N] -> [1,N]
+    if w.ndim != 2 or w.shape[1] == 0:
+        return None
+    inter = w.transpose(0, 1).contiguous().numpy().astype("<f4")   # ffmpeg wants interleaved samples
+    fd, path = tempfile.mkstemp(suffix=".f32le", prefix="ocio_audio_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(inter.tobytes())
+    return path, sr, int(w.shape[0])
+
+
+def save_video(arr01, out_path, codec, fps, output_colorspace=None, audio=None):
     _require_ffmpeg()
     n, h, w, _ = arr01.shape
     enc = {
@@ -865,12 +901,29 @@ def save_video(arr01, out_path, codec, fps, output_colorspace=None):
         "h264": ["-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p"],
         "hevc": ["-c:v", "libx265", "-crf", "18", "-pix_fmt", "yuv420p"],
     }.get(codec, ["-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p"])
-    cmd = [_FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le",
-           "-s", f"{w}x{h}", "-r", str(fps), "-i", "-", *enc, *_video_color_tags(output_colorspace),
-           "-r", str(fps), out_path]
-    proc = subprocess.run(cmd, input=(np.clip(arr01, 0, 1) * 65535).astype("<u2").tobytes(), capture_output=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg encode failed: {proc.stderr.decode('utf-8', 'ignore')[:300]}")
+    snd = _audio_raw_temp(audio)
+    try:
+        cmd = [_FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le",
+               "-s", f"{w}x{h}", "-r", str(fps), "-i", "-"]
+        if snd:
+            apath, asr, ach = snd
+            cmd += ["-f", "f32le", "-ar", str(asr), "-ac", str(ach), "-i", apath]
+        cmd += [*enc, *_video_color_tags(output_colorspace), "-r", str(fps)]
+        if snd:
+            # Explicit -map: with two inputs ffmpeg's automatic stream selection can silently drop the track.
+            # .mov (ProRes / DNxHR) carries 24-bit PCM the way post expects; .mp4 needs a compressed track.
+            acodec = ["-c:a", "aac", "-b:a", "320k"] if out_path.lower().endswith(".mp4") else ["-c:a", "pcm_s24le"]
+            cmd += ["-map", "0:v:0", "-map", "1:a:0", *acodec, "-shortest"]
+        cmd += [out_path]
+        proc = subprocess.run(cmd, input=(np.clip(arr01, 0, 1) * 65535).astype("<u2").tobytes(), capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg encode failed: {proc.stderr.decode('utf-8', 'ignore')[:300]}")
+    finally:
+        if snd:
+            try:
+                os.remove(snd[0])
+            except OSError:
+                pass
     return out_path
 
 
@@ -1133,6 +1186,11 @@ class OCIOWrite:
                              "tooltip": "Used for still image / sequence (hidden for video)."}),
             "video_codec": (["prores_4444", "prores_422hq", "prores_422", "dnxhr_hq", "h264", "hevc"],
                             {"default": "prores_4444", "tooltip": "Used for video (hidden otherwise)."}),
+            "write_audio": ("BOOLEAN", {"default": True,
+                            "tooltip": "Video only: mux the audio into the movie. Turn OFF to write picture only "
+                            "WITHOUT unwiring the audio input. Needs sound on the 'audio' input (or inside the "
+                            "ComfyUI Video input); with none connected this does nothing. .mov gets 24-bit PCM, "
+                            ".mp4 gets AAC 320k."}),
             "bit_depth": (["16f", "32f", "16", "8"], {"default": "16f",
                           "tooltip": "Per format: JPEG 8; PNG 8/16; TIFF 8/16/32f; EXR 16f/32f. The list narrows to the chosen format."}),
             "compression": (["zip", "zips", "piz", "pxr24", "dwaa", "dwab", "rle", "none"], {"default": "zip",
@@ -1159,6 +1217,9 @@ class OCIOWrite:
             "images": ("IMAGE", {"tooltip": "An image / sequence / video frame batch to write. Mutually exclusive with the ComfyUI Video input."}),
             "video": ("VIDEO", {"tooltip": "A ComfyUI native VIDEO (e.g. Load Video) to render out with ALL these Write settings (container, codec, colorspace, bit depth). Mutually exclusive with the image input; the movie's own frame rate is used for a video container."}),
             "alpha": ("MASK", {"tooltip": "Optional alpha channel -> RGBA (EXR / TIFF / PNG; ignored for JPEG). Wire OCIO Read's alpha output, or any MASK."}),
+            "audio": ("AUDIO", {"tooltip": "Optional soundtrack for a video container (e.g. LTX-2.5's LTXV Audio "
+                                "VAE Decode). Wins over audio carried inside the ComfyUI Video input. Ignored for "
+                                "still image / sequence, and when write_audio is off."}),
             "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.001,
                               "tooltip": "Video frame rate. Wire OCIO Read's fps output here to carry the source rate."}),
             "render_nonce": ("STRING", {"default": "",
@@ -1180,11 +1241,14 @@ class OCIOWrite:
     def write(self, profile, from_colorspace, output_colorspace, container, still_format, video_codec,
               bit_depth, auto_range, first_frame, last_frame, start_number, source_start, raw_data,
               output_folder, filename, colorspace_in_name=True, auto_colorspace=True, compression="zip",
-              alpha=None, fps=24.0, render_nonce="", images=None, video=None):   # render_nonce: cache-buster (see INPUT_TYPES). images/video: mutually-exclusive inputs.
+              alpha=None, fps=24.0, render_nonce="", images=None, video=None,
+              write_audio=True, audio=None):   # render_nonce: cache-buster (see INPUT_TYPES). images/video: mutually-exclusive inputs.
         if video is not None:                                        # a native ComfyUI VIDEO -> render it out with ALL these Write settings (container, codec, colorspace, bit depth)
-            images, _vfps, _ = _video_unwrap(video)
+            images, _vfps, _vaudio = _video_unwrap(video)
             if _vfps and _vfps > 0:
                 fps = _vfps                                          # a video container inherits the movie's own frame rate
+            if audio is None:
+                audio = _vaudio                                      # the movie's own sound; an explicit 'audio' input wins
         if images is None:
             raise ValueError("OCIO Write: connect an image / sequence to 'OCIO Img/Seq/Vid', OR a movie to 'ComfyUI Video'.")
         _LOG_PROFILES = {"LumiPic LogC3 (Flux/Qwen)": _logc3_to_lin, "LumiPic V10 LogC4": _logc4_to_lin}
@@ -1239,8 +1303,11 @@ class OCIOWrite:
                 raise RuntimeError(f"nothing in write range [{first_frame}-{last_frame}] (input has {n} frame(s))")
             if container == "video":
                 saved = _wp(1)[0]
-                save_video(sub, saved, video_codec, float(fps) if fps and fps > 0 else 24.0,
-                           None if raw_data else output_colorspace)
+                rate = float(fps) if fps and fps > 0 else 24.0
+                # audio rides along only when asked for AND present; trimmed to the same [s:e] frames as the picture
+                snd = _audio_for_range(audio, s, min(e, n), rate) if (write_audio and audio) else None
+                save_video(sub, saved, video_codec, rate,
+                           None if raw_data else output_colorspace, snd)
             else:                                                          # sequence
                 paths = _wp(sub.shape[0])
                 for i in range(sub.shape[0]):
