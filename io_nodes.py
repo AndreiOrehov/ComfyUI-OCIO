@@ -505,25 +505,38 @@ def _proxy_dir():
     os.makedirs(d, exist_ok=True)
     return d
 
+_PROXY_RECIPE = "v2-audio"   # bump whenever _proxy_transcode_cmd changes shape, so cached proxies are rebuilt
+
+
 def _proxy_path(path):
     """Deterministic cache path for a source's H.264 proxy, keyed by realpath+mtime+size (an edited source
-    re-transcodes). .mp4 (a VIDEO_EXTS ext) so /ocio/stream will serve it back."""
+    re-transcodes). .mp4 (a VIDEO_EXTS ext) so /ocio/stream will serve it back.
+
+    _PROXY_RECIPE is part of the key on purpose: the source file does not change when the TRANSCODE does, so
+    without it every proxy built before audio was added would be served forever and the Player would stay
+    silent with no way to tell why."""
     try:
         st = os.stat(path)
-        key = f"{os.path.realpath(path)}|{int(st.st_mtime)}|{st.st_size}"
+        key = f"{os.path.realpath(path)}|{int(st.st_mtime)}|{st.st_size}|{_PROXY_RECIPE}"
     except OSError:
-        key = path
+        key = f"{path}|{_PROXY_RECIPE}"
     return os.path.join(_proxy_dir(), hashlib.sha1(key.encode("utf-8", "ignore")).hexdigest()[:16] + ".mp4")
 
 def _proxy_transcode_cmd(src, dst):
     """ffmpeg args to build the H.264 proxy: downscale to _PROXY_MAX_SIDE (even dims for yuv420p), yuv420p +
-    faststart so the <video> streams + seeks, no audio (the Player is muted). One-time; cached by _proxy_path."""
+    faststart so the <video> streams + seeks. One-time; cached by _proxy_path.
+
+    The proxy CARRIES AUDIO (2026-08-11). It used to be stripped because nothing generated sound; models like
+    LTX-2.5 and Seedance now do, and the Player's meter + mute button were already built for it - they just had
+    no track to read. A browser-friendly file (h264/vp8/vp9/av1) skips the proxy entirely and streams the
+    original, so it already had sound; only the codecs that NEED a proxy (ProRes, DNxHR, ...) were silent."""
     _require_ffmpeg()
     return [_FFMPEG, "-v", "error", "-y", "-i", src,
-            "-map", "0:v:0",                                  # ONLY the first video stream (drop audio / extra tracks)
+            "-map", "0:v:0", "-map", "0:a:0?",                # video + audio if present ('?' = optional, silent sources still transcode)
             "-vf", f"scale='min({_PROXY_MAX_SIDE},iw)':-2:flags=bicubic",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-            "-an", "-write_tmcd", "0",                        # a ProRes/MXF carries a timecode track that ffmpeg auto-writes as a 'tmcd' DATA stream into the mp4; a <video> element can STALL on that extra stream (buffers but no picture). -write_tmcd 0 = a clean VIDEO-ONLY proxy.
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2",        # <video> plays AAC everywhere; PCM in an mp4 does not
+            "-write_tmcd", "0",                               # a ProRes/MXF carries a timecode track that ffmpeg auto-writes as a 'tmcd' DATA stream into the mp4; a <video> element can STALL on that extra stream (buffers but no picture). -write_tmcd 0 keeps the proxy to video+audio only.
             "-movflags", "+faststart", dst]
 
 
@@ -1317,6 +1330,7 @@ class OCIOWrite:
             fr = src_a[min(i, src_a.shape[0] - 1)]
             return fr if fr.shape[:2] == ref.shape[:2] else None
 
+        snd = None                                                          # set by the video branch; read again by the preview
         if container == "still image":
             idx = min(max(0, first_frame - base), n - 1)                   # frame number -> batch index
             # a still grabbed from a sequence / video (n>1) stamps its SOURCE frame number in the name
@@ -1350,7 +1364,7 @@ class OCIOWrite:
             # The output video can sit ANYWHERE on disk; ComfyUI's native preview only serves output/temp/input, and a
             # still PNG renders broken inside its <video> for a video node ("Invalid URL"). So write a small, always-
             # servable H.264 preview into the temp dir and show it as an animated (playing) preview instead.
-            ui["images"] = self._video_preview(sub, fps, saved)
+            ui["images"] = self._video_preview(sub, fps, saved, snd)
             ui["animated"] = (True,)
         else:
             ui["images"] = self._preview(preview)
@@ -1360,11 +1374,14 @@ class OCIOWrite:
         """First written frame, shown naively in its output colorspace (a wrong pick looks visibly wrong)."""
         return _save_preview_png(frame0, "ocio_write_preview.png")
 
-    def _video_preview(self, arr, fps, seed=""):
+    def _video_preview(self, arr, fps, seed="", audio=None):
         """A small, always-servable H.264 preview of the just-written clip, in ComfyUI's TEMP dir, for the node's
         video preview (the real output may be an absolute path ComfyUI cannot serve). Downscaled to <=512 wide and
         capped to 96 frames, so it is cheap and browser-playable (h264) even when the master is ProRes/DNxHR. Returns
-        the ui 'images' list; pair with 'animated': (True,) so ComfyUI shows a playing video."""
+        the ui 'images' list; pair with 'animated': (True,) so ComfyUI shows a playing video.
+
+        Carries the soundtrack too (2026-08-12), so the on-node player is not silent while the written master has
+        sound. The frame cap can make the preview shorter than the audio; save_video's -shortest trims it."""
         if folder_paths is None:
             return []
         try:
@@ -1379,7 +1396,7 @@ class OCIOWrite:
                 nh -= nh % 2                                                          # even dims for h264
                 a = np.stack([cv2.resize(f, (nw, nh), interpolation=cv2.INTER_AREA) for f in a])
             name = "ocio_write_prev_" + hashlib.md5(str(seed).encode("utf-8", "ignore")).hexdigest()[:8] + ".mp4"
-            save_video(a, os.path.join(tdir, name), "h264", float(fps) if fps and fps > 0 else 24.0, None)
+            save_video(a, os.path.join(tdir, name), "h264", float(fps) if fps and fps > 0 else 24.0, None, audio)
             return [{"filename": name, "subfolder": "", "type": "temp"}]
         except Exception:
             return []
