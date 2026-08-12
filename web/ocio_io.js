@@ -2256,14 +2256,23 @@ app.registerExtension({
                 // sizing - because it also runs from the onNodeCreated timer, which fires after configure() has
                 // restored the saved values. The default colorspace is written here instead: on a real container
                 // change, which is a deliberate act. Same split as OCIO Read, issue #3.
+                // A profile OWNS the colorspaces while it is selected, so the per-container default must not
+                // overwrite it. Without this guard, picking "LTX 2.5 -> Rec.709 video" and then touching the
+                // container reset output_colorspace to sRGB (autoOutCs answers sRGB for video) AND, because
+                // setW fires the widget callback, tripped the manual-edit handler below, which silently put
+                // profile back to "none". The delivery preset vanished with no visible cause.
+                const syncOutCs = () => {
+                    if ((W(node, "profile")?.value || "none") !== "none") return;
+                    setW(node, "output_colorspace", autoOutCs(W(node, "container")?.value, W(node, "still_format")?.value));
+                };
                 onChange(this, "container", () => {
                     applyContainer();
-                    setW(node, "output_colorspace", autoOutCs(W(node, "container")?.value, W(node, "still_format")?.value));
+                    syncOutCs();
                 });
                 onChange(this, "still_format", () => {
                     applyFormat();
                     applyCompressionVis();
-                    setW(node, "output_colorspace", autoOutCs(W(node, "container")?.value, W(node, "still_format")?.value));
+                    syncOutCs();
                     pokeWidgets(node);
                 });
                 onChange(this, "video_codec", () => { applyCodecLabel(); pokeWidgets(node); node.setDirtyCanvas(true, true); });
